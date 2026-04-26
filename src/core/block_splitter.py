@@ -45,10 +45,15 @@ def split_into_blocks(
     log_info["bank_total"] = round(total_bank, 2)
 
     # 总额校验：如果总额差异太大，说明数据不平，直接返回一个大 block
+    # total_diff = abs(total_gl - total_bank)
+    # if total_diff > max(tol, abs(total_gl) * 0.001):
+    #     log_info["note"] = f"总额不平，差异 {total_diff:.2f}，无法分块"
+    #     return [(gl_entries, bank_entries)], log_info
+    
+    # 总额不平，继续切block
     total_diff = abs(total_gl - total_bank)
     if total_diff > max(tol, abs(total_gl) * 0.001):
-        log_info["note"] = f"总额不平，差异 {total_diff:.2f}，无法分块"
-        return [(gl_entries, bank_entries)], log_info
+        log_info["warning"] = f"总额不平，差异 {total_diff:.2f}，但继续尝试分块"
 
     # 构建 Bank 累计额字典: {rounded_value: index}
     # 由于累计额单调（同方向），每个值只保留第一次出现的位置

@@ -8,11 +8,16 @@ def solve_large_block(
     bank_entries: List,
     tol: float = 0.01,
     time_window_days: int = 30,
-    use_customer: bool = True
+    use_customer: bool = True,
+    dynamic_greedy: bool = True
 ) -> Tuple[List[Tuple], List, List]:
     """
     大 Block 匹配策略（CSR 工程）
-    
+
+    参数:
+        dynamic_greedy: True=动态贪心（候选池最小的 GL 优先处理，默认）
+                       False=按 GL 原始顺序依次处理
+
     返回: (matches, unmatched_gl, unmatched_bank)
     matches: [(gl_entry, [bank_entries...], match_type), ...]
     """
@@ -23,32 +28,48 @@ def solve_large_block(
 
     unmatched_gl = []
 
-    # 动态贪心：每轮选候选池最小的 GL 先处理
     remaining_gl = list(range(len(gl_list)))
 
     while remaining_gl:
-        # 为每个未匹配 GL 构建候选池（考虑已被占用的 Bank）
-        best_gi = None
-        best_candidates = None
-        best_count = float('inf')
+        if dynamic_greedy:
+            # 动态贪心：每轮选候选池最小的 GL 先处理
+            best_gi = None
+            best_candidates = None
+            best_count = float('inf')
 
-        for gi in remaining_gl:
+            for gi in remaining_gl:
+                candidates = _build_candidates(
+                    gl_list[gi], bank_list, bank_used,
+                    tol, time_window_days, use_customer
+                )
+                if len(candidates) < best_count:
+                    best_count = len(candidates)
+                    best_gi = gi
+                    best_candidates = candidates
+
+            # 修复：候选数为0时，只移除当前GL，不株连其他
+            if best_gi is None:
+                # 防御性判断，理论上不会发生
+                break
+            if best_count == 0:
+                unmatched_gl.append(gl_list[best_gi])
+                remaining_gl.remove(best_gi)
+                continue  # 继续下一轮，其他GL还有机会
+            
+            g = gl_list[best_gi]
+            candidates = best_candidates
+        else:
+            # 按 GL 原始顺序依次处理
+            best_gi = remaining_gl[0]
+            g = gl_list[best_gi]
             candidates = _build_candidates(
-                gl_list[gi], bank_list, bank_used,
+                g, bank_list, bank_used,
                 tol, time_window_days, use_customer
             )
-            if len(candidates) < best_count:
-                best_count = len(candidates)
-                best_gi = gi
-                best_candidates = candidates
-
-        if best_gi is None or best_count == 0:
-            # 没有候选，剩余 GL 全部未匹配
-            unmatched_gl.extend(gl_list[i] for i in remaining_gl)
-            break
-
-        g = gl_list[best_gi]
-        candidates = best_candidates
+            if not candidates:
+                unmatched_gl.append(g)
+                remaining_gl.pop(0)
+                continue
 
         # 在候选池内尝试漏斗策略
         match_result = _funnel_in_candidates(g, candidates, tol)
@@ -154,8 +175,8 @@ def _funnel_in_candidates(
         if _amount_match(g_amount, abs(b.amount), tol):
             return ([b], "csr_1v1")
 
-    # 2. 按摘要+日期+交易方聚合
-    for agg_level in range(2, 5):
+    # 2. 按摘要+日期+交易方聚合（agg1 含金额，agg2~agg4 不含金额）
+    for agg_level in range(1, 5):
         groups = defaultdict(list)
         for b in candidates:
             key = _agg_key_large(b, agg_level)
@@ -184,8 +205,11 @@ def _agg_key_large(bank_entry, level: int) -> tuple:
     date_str = b.tx_date.strftime("%Y-%m-%d") if hasattr(b, 'tx_date') else ""
     abstract = getattr(b, 'abstract', '')
     counter_party = getattr(b, 'counter_party', '')
+    amount = round(b.amount, 2)
 
-    if level == 2:
+    if level == 1:
+        return (abstract, date_str, counter_party, amount)
+    elif level == 2:
         return (abstract, date_str, counter_party)
     elif level == 3:
         return (date_str, counter_party)

@@ -53,8 +53,7 @@ def clean_journal(
         except Exception as e:
             errors.append({"index": idx, "reason": str(e), "raw": row.to_dict()})
 
-    # 按日期排序（保持上下结构）
-    entries.sort(key=lambda x: (x.entry_date, x.idx))
+    # 严格保留 Excel 原始行序，不排序
     return entries, errors
 
 
@@ -95,8 +94,7 @@ def clean_bank(
         except Exception as e:
             errors.append({"index": idx, "reason": str(e), "raw": row.to_dict()})
 
-    # 按日期排序（保持上下结构）
-    entries.sort(key=lambda x: (x.tx_date, x.idx))
+    # 严格保留 Excel 原始行序，不排序
     return entries, errors
 
 
@@ -157,17 +155,19 @@ def split_by_month_and_direction(entries: list):
 
 
 def _parse_amount(val) -> float:
-    """解析金额，处理各种格式"""
+    """解析金额，处理各种格式，强制保留2位小数消除浮点精度问题"""
     if val is None:
         return 0.0
+    if isinstance(val, float) and pd.isna(val):
+        return 0.0
     if isinstance(val, (int, float)):
-        return float(val)
+        return round(float(val), 2)
     s = str(val).strip().replace(",", "").replace("，", "")
     # 处理括号负数 (100.00) -> -100.00
     if s.startswith("(") and s.endswith(")"):
         s = "-" + s[1:-1]
     try:
-        return float(s)
+        return round(float(s), 2)
     except ValueError:
         return 0.0
 

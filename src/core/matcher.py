@@ -26,10 +26,12 @@ class ReconciliationResult:
 class ReconciliationEngine:
     """序时账与银行流水核对引擎"""
 
-    def __init__(self, tol: float = 0.01, small_threshold: int = SMALL_BLOCK_THRESHOLD, date_window_days: int = 7):
+    def __init__(self, tol: float = 0.01, small_threshold: int = SMALL_BLOCK_THRESHOLD,
+                 date_window_days: int = 15, dynamic_greedy: bool = True):
         self.tol = tol
         self.small_threshold = small_threshold
         self.date_window_days = date_window_days
+        self.dynamic_greedy = dynamic_greedy
         self.field_mapper = FieldMapper()
 
     def _compute_block_date_window(self, gl_block, bank_block) -> int:
@@ -56,24 +58,33 @@ class ReconciliationEngine:
         self.journal_df = df
         return self.field_mapper.validate_journal()
 
-    def load_bank(self, df: pd.DataFrame, manual_map: Dict[str, str] = None) -> List[str]:
-        """加载银行流水，返回未识别到的必填字段列表"""
-        self.field_mapper.auto_map_bank(df)
+    def load_bank(self, filename: str, df: pd.DataFrame, manual_map: Dict[str, str] = None) -> List[str]:
+        """加载指定银行流水文件，返回未识别到的必填字段列表"""
+        self.field_mapper.auto_map_bank(filename, df)
         if manual_map:
             for k, v in manual_map.items():
-                self.field_mapper.set_bank_field(k, v)
-        self.bank_df = df
-        return self.field_mapper.validate_bank()
+                self.field_mapper.set_bank_field(filename, k, v)
+        if not hasattr(self, 'bank_dfs'):
+            self.bank_dfs = {}
+        self.bank_dfs[filename] = df
+        return self.field_mapper.validate_bank(filename)
 
-    def check_ready(self) -> List[str]:
+    def check_ready(self, bank_filenames: List[str] = None) -> List[str]:
         """检查是否所有必填字段已配置，返回错误信息列表"""
         errors = []
         journal_missing = self.field_mapper.validate_journal()
         if journal_missing:
             errors.append(f"序时账缺少必填字段: {journal_missing}")
-        bank_missing = self.field_mapper.validate_bank()
-        if bank_missing:
-            errors.append(f"银行流水缺少必填字段: {bank_missing}")
+
+        if bank_filenames:
+            for filename in bank_filenames:
+                bank_missing = self.field_mapper.validate_bank(filename)
+                if bank_missing:
+                    errors.append(f"银行流水[{filename}]缺少必填字段: {bank_missing}")
+        else:
+            all_missing = self.field_mapper.validate_all_banks()
+            for filename, missing in all_missing:
+                errors.append(f"银行流水[{filename}]缺少必填字段: {missing}")
         return errors
 
     def run(self, detail_account: str = None) -> Dict[str, ReconciliationResult]:
@@ -102,11 +113,17 @@ class ReconciliationEngine:
         journal_entries, journal_errors = clean_journal(
             self.journal_df, self.field_mapper.journal_map
         )
-        bank_entries, bank_errors = clean_bank(
-            self.bank_df, self.field_mapper.bank_map
-        )
 
-        # diagnostics 全部用扁平结构，避免嵌套元组导致序列化失败
+        # 按文件分别清洗银行流水，然后合并
+        bank_entries = []
+        bank_errors = []
+        for filename, df in getattr(self, 'bank_dfs', {}).items():
+            b_entries, b_errors = clean_bank(
+                df, self.field_mapper.bank_maps.get(filename, {})
+            )
+            bank_entries.extend(b_entries)
+            bank_errors.extend(b_errors)
+
         diagnostics = {
             "journal_total": len(journal_entries),
             "journal_errors": len(journal_errors),
@@ -182,7 +199,31 @@ class ReconciliationEngine:
                 # 4. 最小平扫区域分块
                 blocks, block_log = split_into_blocks(gl_month_entries, bank_month_entries, self.tol)
                 month_info["blocks"] = len(blocks)
-                month_info["block_log"] = block_log.get("blocks", [])
+                block_log_entries = block_log.get("blocks", [])
+                # 补充每个 block 的 GL/Bank 明细，用于诊断顺序问题
+                for idx, (gl_block, bank_block) in enumerate(blocks):
+                    if idx < len(block_log_entries):
+                        block_log_entries[idx]["gl_details"] = [
+                            {
+                                "idx_in_block": i,
+                                "voucher_no": getattr(e, 'voucher_no', ''),
+                                "abstract": str(getattr(e, 'abstract', ''))[:40],
+                                "amount": round(e.amount, 2),
+                                "date": str(getattr(e, 'entry_date', None) or getattr(e, 'tx_date', None)),
+                            }
+                            for i, e in enumerate(gl_block)
+                        ]
+                        block_log_entries[idx]["bank_details"] = [
+                            {
+                                "idx_in_block": i,
+                                "counter_party": str(getattr(e, 'counter_party', ''))[:30],
+                                "abstract": str(getattr(e, 'abstract', ''))[:40],
+                                "amount": round(e.amount, 2),
+                                "date": str(getattr(e, 'tx_date', None) or getattr(e, 'entry_date', None)),
+                            }
+                            for i, e in enumerate(bank_block)
+                        ]
+                month_info["block_log"] = block_log_entries
 
                 month_matches = 0
                 for gl_block, bank_block in blocks:
@@ -193,14 +234,13 @@ class ReconciliationEngine:
 
                     # 计算当前 block 的日期容差
                     block_date_window = self._compute_block_date_window(gl_block, bank_block)
-
-                    # 5. 判断 Block 大小，分别处理
                     is_small = len(gl_block) <= self.small_threshold and len(bank_block) <= self.small_threshold
 
                     if is_small:
                         m, ug, ub = solve_small_block(gl_block, bank_block, self.tol, block_date_window)
                     else:
-                        m, ug, ub = solve_large_block(gl_block, bank_block, self.tol, block_date_window)
+                        m, ug, ub = solve_large_block(gl_block, bank_block, self.tol, block_date_window,
+                                                      dynamic_greedy=self.dynamic_greedy)
 
                     result.matches.extend(m)
                     result.unmatched_gl.extend(ug)
@@ -249,28 +289,80 @@ class ReconciliationEngine:
         return pd.DataFrame(rows)
 
 
-def export_results(results: Dict[str, ReconciliationResult], output_path: str):
-    """导出核对结果到 Excel"""
-    import openpyxl
-    from openpyxl.styles import PatternFill, Font
+MATCH_TYPE_MAP = {
+    "1v1": "一对一",
+    "agg1": "一级聚合",
+    "agg2": "二级聚合",
+    "agg3": "三级聚合",
+    "agg4": "四级聚合",
+    "dp_subset": "子集和(DP)",
+    "backtrack_subset": "子集和(回溯)",
+    "gl_dp_subset": "GL凑Bank(DP)",
+    "gl_backtrack_subset": "GL凑Bank(回溯)",
+    "csr_1v1": "CSR一对一",
+    "csr_agg2": "CSR二级聚合",
+    "csr_agg3": "CSR三级聚合",
+    "csr_agg4": "CSR四级聚合",
+    "csr_subset": "CSR子集和",
+}
 
+
+def export_results(results: Dict[str, ReconciliationResult], output_path: str):
+    """导出核对结果到 Excel
+    
+    输出格式：
+    - 一对一匹配：1 行（GL + 1 个 Bank）
+    - 一对多匹配：多行（GL 信息重复，每行 1 个 Bank）
+    - 未匹配：各 1 行
+    """
     rows = []
     for acc, res in results.items():
-        # 匹配结果
+        # 追踪已显示过金额的 Bank（避免 Bank 一对多时重复显示）
+        shown_bank_ids = set()
+
+        # 匹配结果（展开为多行）
         for gl, banks, mtype in res.matches:
-            rows.append({
-                "明细科目": acc,
-                "类型": "匹配",
-                "匹配方式": mtype,
-                "GL日期": getattr(gl, 'entry_date', None),
-                "GL凭证号": getattr(gl, 'voucher_no', ''),
-                "GL摘要": getattr(gl, 'abstract', ''),
-                "GL金额": gl.amount,
-                "Bank笔数": len(banks),
-                "Bank日期": ", ".join(str(getattr(b, 'tx_date', '')) for b in banks),
-                "Bank交易方": ", ".join(getattr(b, 'counter_party', '') for b in banks),
-                "Bank金额合计": sum(b.amount for b in banks),
-            })
+            mtype_cn = MATCH_TYPE_MAP.get(mtype, mtype)
+            if len(banks) == 1:
+                # 一对一：一行
+                b = banks[0]
+                bid = id(b)
+                show_bank_amount = bid not in shown_bank_ids
+                shown_bank_ids.add(bid)
+                rows.append({
+                    "明细科目": acc,
+                    "类型": "匹配",
+                    "匹配方式": mtype_cn,
+                    "GL日期": getattr(gl, 'entry_date', None),
+                    "GL凭证号": getattr(gl, 'voucher_no', ''),
+                    "GL摘要": getattr(gl, 'abstract', ''),
+                    "GL金额": gl.amount,
+                    "Bank日期": getattr(b, 'tx_date', ''),
+                    "Bank交易方": getattr(b, 'counter_party', ''),
+                    "Bank金额": b.amount if show_bank_amount else None,
+                    "Bank摘要": getattr(b, 'abstract', ''),
+                    "Bank流水号": getattr(b, 'serial_no', ''),
+                })
+            else:
+                # 一对多：每行一个 Bank，GL 金额只在第一行显示
+                for i, b in enumerate(banks):
+                    bid = id(b)
+                    show_bank_amount = bid not in shown_bank_ids
+                    shown_bank_ids.add(bid)
+                    rows.append({
+                        "明细科目": acc,
+                        "类型": "匹配",
+                        "匹配方式": mtype_cn,
+                        "GL日期": getattr(gl, 'entry_date', None),
+                        "GL凭证号": getattr(gl, 'voucher_no', ''),
+                        "GL摘要": getattr(gl, 'abstract', ''),
+                        "GL金额": gl.amount if i == 0 else None,
+                        "Bank日期": getattr(b, 'tx_date', ''),
+                        "Bank交易方": getattr(b, 'counter_party', ''),
+                        "Bank金额": b.amount if show_bank_amount else None,
+                        "Bank摘要": getattr(b, 'abstract', ''),
+                        "Bank流水号": getattr(b, 'serial_no', ''),
+                    })
         # 未匹配 GL
         for gl in res.unmatched_gl:
             rows.append({
@@ -281,10 +373,9 @@ def export_results(results: Dict[str, ReconciliationResult], output_path: str):
                 "GL凭证号": getattr(gl, 'voucher_no', ''),
                 "GL摘要": getattr(gl, 'abstract', ''),
                 "GL金额": gl.amount,
-                "Bank笔数": 0,
-                "Bank日期": "",
+                "Bank日期": None,
                 "Bank交易方": "",
-                "Bank金额合计": 0,
+                "Bank金额": None,
             })
         # 未匹配 Bank
         for b in res.unmatched_bank:
@@ -295,13 +386,18 @@ def export_results(results: Dict[str, ReconciliationResult], output_path: str):
                 "GL日期": None,
                 "GL凭证号": "",
                 "GL摘要": "",
-                "GL金额": 0,
-                "Bank笔数": 1,
+                "GL金额": None,
                 "Bank日期": getattr(b, 'tx_date', ''),
                 "Bank交易方": getattr(b, 'counter_party', ''),
-                "Bank金额合计": b.amount,
+                "Bank金额": b.amount,
+                "Bank摘要": getattr(b, 'abstract', ''),
+                "Bank流水号": getattr(b, 'serial_no', ''),
             })
 
     df = pd.DataFrame(rows)
+    # 调整列顺序
+    cols = ["明细科目", "类型", "匹配方式", "GL日期", "GL凭证号", "GL摘要", "GL金额",
+            "Bank日期", "Bank交易方", "Bank金额", "Bank摘要", "Bank流水号"]
+    df = df[[c for c in cols if c in df.columns]]
     df.to_excel(output_path, index=False)
     print(f"结果已导出: {output_path}")

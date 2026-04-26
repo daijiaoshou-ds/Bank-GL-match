@@ -129,20 +129,20 @@ def _match_subset_sum_dp(
     max_combo_size: int = 8
 ):
     """
-    DP 子集和凑数：为每个 GL 找一组 Bank 使其金额之和相等
-    使用动态规划替代暴力枚举，可处理更大规模
+    双向 DP 子集和凑数：
+    阶段1: Bank 凑 GL（为每个 GL 找一组 Bank）
+    阶段2: GL 凑 Bank（为每个 Bank 找一组 GL）
     """
     from src.core.subset_sum import subset_sum_dp_with_fallback
 
+    # ========== 阶段1: Bank 凑 GL ==========
     used_bank = set()
     to_remove_gl = []
 
     for gi, g in enumerate(gl_list):
         target = abs(g.amount)
-
-        # 构建可用 Bank 列表（排除已使用的）
         available_indices = [i for i in range(len(bank_list)) if i not in used_bank]
-        available_amounts = [bank_list[i].amount for i in available_indices]
+        available_amounts = [abs(bank_list[i].amount) for i in available_indices]
 
         if not available_amounts:
             continue
@@ -150,15 +150,13 @@ def _match_subset_sum_dp(
         combo_local, method = subset_sum_dp_with_fallback(
             available_amounts, target, tol, max_combo_size
         )
-        
-        # 子集和成功后，再检查日期是否满足窗口要求
+
         if combo_local is not None:
             combo_entries = [bank_list[available_indices[i]] for i in combo_local]
             if not _date_close_group(g, combo_entries, date_window_days):
-                combo_local = None  # 日期不满足，放弃这个匹配
+                combo_local = None
 
         if combo_local is not None:
-            # 转回全局索引
             global_combo = [available_indices[i] for i in combo_local]
             combo_entries = [bank_list[i] for i in global_combo]
             matches.append((g, combo_entries, method))
@@ -166,13 +164,49 @@ def _match_subset_sum_dp(
                 used_bank.add(i)
             to_remove_gl.append(gi)
 
-    # 移除已匹配的 GL
     for gi in sorted(to_remove_gl, reverse=True):
         gl_list.pop(gi)
-
-    # 移除已匹配的 Bank
     for bi in sorted(used_bank, reverse=True):
         bank_list.pop(bi)
+
+    # ========== 阶段2: GL 凑 Bank ==========
+    if not gl_list or not bank_list:
+        return
+
+    used_gl = set()
+    to_remove_bank = []
+
+    for bi, b in enumerate(bank_list):
+        target = abs(b.amount)
+        available_indices = [i for i in range(len(gl_list)) if i not in used_gl]
+        available_amounts = [abs(gl_list[i].amount) for i in available_indices]
+
+        if not available_amounts:
+            continue
+
+        combo_local, method = subset_sum_dp_with_fallback(
+            available_amounts, target, tol, max_combo_size
+        )
+
+        if combo_local is not None:
+            combo_entries = [gl_list[available_indices[i]] for i in combo_local]
+            if not _date_close_group_bank(b, combo_entries, date_window_days):
+                combo_local = None
+
+        if combo_local is not None:
+            global_combo = [available_indices[i] for i in combo_local]
+            combo_entries = [gl_list[i] for i in global_combo]
+            # 每个 GL 单独匹配到该 Bank，导出时自然展开为多行
+            for gl in combo_entries:
+                matches.append((gl, [b], f"gl_{method}"))
+            for i in global_combo:
+                used_gl.add(i)
+            to_remove_bank.append(bi)
+
+    for bi in sorted(to_remove_bank, reverse=True):
+        bank_list.pop(bi)
+    for gi in sorted(used_gl, reverse=True):
+        gl_list.pop(gi)
 
 
 def _agg_key(bank_entry, level: int) -> tuple:
@@ -214,12 +248,23 @@ def _date_close_group(g, bank_group, max_days: int = 30) -> bool:
     g_date = getattr(g, 'entry_date', None) or getattr(g, 'tx_date', None)
     if g_date is None or not bank_group:
         return True
-    # 取 Bank 组内最早和最晚的日期
     dates = [getattr(b, 'tx_date', None) or getattr(b, 'entry_date', None) for b in bank_group]
     dates = [d for d in dates if d is not None]
     if not dates:
         return True
     min_date = min(dates)
-    max_date = max(dates)
-    # GL 日期应在 Bank 日期之后 max_days 天内
     return 0 <= (g_date - min_date).days <= max_days
+
+
+def _date_close_group_bank(bank, gl_group, max_days: int = 30) -> bool:
+    """判断 Bank 日期与 GL 组内日期是否接近（GL 凑 Bank 场景）"""
+    b_date = getattr(bank, 'tx_date', None) or getattr(bank, 'entry_date', None)
+    if b_date is None or not gl_group:
+        return True
+    dates = [getattr(g, 'entry_date', None) or getattr(g, 'tx_date', None) for g in gl_group]
+    dates = [d for d in dates if d is not None]
+    if not dates:
+        return True
+    max_gl_date = max(dates)
+    # Bank 日期应在 GL 最晚日期之后 max_days 天内
+    return 0 <= (b_date - max_gl_date).days <= max_days

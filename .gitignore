@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .vscode/
 .DS_Store
-*.log
+log
 
 theory.md
+matching_logic_audit.md
