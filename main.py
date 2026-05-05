@@ -21,7 +21,6 @@ def main():
     parser.add_argument("--sheet-bank", default=0, help="银行流水 sheet 名称或索引")
     parser.add_argument("--account", default=None, help="指定核对某个明细科目（如：银行存款-建行0911）")
     parser.add_argument("--tol", type=float, default=0.01, help="金额匹配容差（默认 0.01）")
-    parser.add_argument("--threshold", type=int, default=10, help="小 Block 阈值（默认 10）")
 
     args = parser.parse_args()
 
@@ -33,7 +32,7 @@ def main():
     df_bank = pd.read_excel(args.bank, sheet_name=args.sheet_bank)
     print(f"   共 {len(df_bank)} 行, 列: {list(df_bank.columns)}")
 
-    engine = ReconciliationEngine(tol=args.tol, small_threshold=args.threshold)
+    engine = ReconciliationEngine(tol=args.tol)
 
     try:
         engine.load_journal(df_journal)

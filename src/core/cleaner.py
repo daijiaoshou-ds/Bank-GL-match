@@ -38,6 +38,10 @@ def clean_journal(
             debit = _parse_amount(d.get(col_map.get("debit")))
             credit = _parse_amount(d.get(col_map.get("credit")))
 
+            customer_name = _str_or_empty(d.get(col_map.get("customer_name")))
+            # 解析多个客商（由对方科目分析生成，用"，"分隔）
+            counterparties = [p.strip() for p in customer_name.split("，") if p.strip()] if customer_name else []
+
             entry = JournalEntry(
                 idx=int(idx),
                 entry_date=entry_date,
@@ -47,7 +51,8 @@ def clean_journal(
                 detail_account=_str_or_empty(d.get(col_map.get("detail_account"))),
                 debit=debit,
                 credit=credit,
-                customer_name=_str_or_empty(d.get(col_map.get("customer_name"))),
+                customer_name=customer_name,
+                counterparties=counterparties,
             )
             entries.append(entry)
         except Exception as e:

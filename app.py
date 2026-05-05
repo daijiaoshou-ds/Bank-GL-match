@@ -73,26 +73,18 @@ with st.sidebar:
         help="浮点数精度容差，建议 0.001",
     )
 
-    threshold = st.number_input(
-        "小 Block 阈值",
-        min_value=1,
-        max_value=50,
-        value=10,
-        step=1,
-        help="Block 内双方条目数均 ≤ 此值时，使用小 Block 策略",
-    )
 
     date_window = st.number_input(
         "日期容差天数",
         min_value=1,
         max_value=365,
-        value=15,
+        value=31,
         step=1,
-        help="GL 记账日期与 Bank 交易日期的最大允许差距（默认 15 天）。Block 内会取 min(15天, block实际跨度)",
+        help="GL 记账日期与 Bank 交易日期的最大允许差距（默认 31 天/一个月）。超出此范围的流水不会互相匹配。",
     )
 
     dynamic_greedy = st.checkbox(
-        "大Block动态贪心排序",
+        "动态贪心排序",
         value=True,
         help="勾选时：每轮按候选池从小到大排序处理（简单GL优先，快但有抢占风险）。\n"
              "取消时：按GL原始顺序处理（慢但更稳定，避免简单GL抢占Bank导致复杂GL无解）。",
@@ -138,7 +130,7 @@ for name, df in bank_dfs.items():
 file_signature = f"{journal_file.name}_{bank_sig}_{len(df_journal)}"
 
 if "engine_sig" not in st.session_state or st.session_state.engine_sig != file_signature:
-    engine = ReconciliationEngine(tol=tol, small_threshold=threshold, date_window_days=date_window,
+    engine = ReconciliationEngine(tol=tol, date_window_days=date_window,
                                   dynamic_greedy=dynamic_greedy)
     journal_missing = engine.load_journal(df_journal)
 
@@ -158,7 +150,6 @@ else:
     journal_missing = st.session_state.journal_missing
     bank_missing = st.session_state.bank_missing
     engine.tol = tol
-    engine.small_threshold = threshold
     engine.date_window_days = date_window
     engine.dynamic_greedy = dynamic_greedy
 
@@ -438,6 +429,23 @@ if "diagnostics" in st.session_state:
     c3.metric("银行流水清洗成功", diag["bank_total"])
     c4.metric("银行流水清洗失败", diag["bank_errors"])
 
+    # 显示对方科目分析结果
+    with st.expander("📋 对方科目分析结果"):
+        cpa = diag.get("counterparty_analysis", {})
+        if cpa:
+            st.markdown(f"对方科目分析统计（按凭证号分组）：")
+            col_a1, col_a2, col_a3, col_a4 = st.columns(4)
+            col_a1.metric("简单拆分", cpa.get("simple_count", 0),
+                         help="非银行存款只有一个科目 → 按金额拆分，一一对应客商")
+            col_a2.metric("多银行账户", cpa.get("multi_bank_count", 0),
+                         help="有多个银行明细账户 → 金额对应或聚合")
+            col_a3.metric("复杂聚合", cpa.get("complex_count", 0),
+                         help="非银行存款有多个科目 → 客商全部聚合")
+            col_a4.metric("无对方科目", cpa.get("no_counterparty_count", 0),
+                         help="凭证只有银行存款行，无对方科目")
+        else:
+            st.info("无对方科目分析数据（可能在清洗前未执行分析）")
+
     # 显示检测到的明细科目列表
     with st.expander("📋 检测到的明细科目列表"):
         all_detected_accounts = list(diag["journal_by_account"].keys())
@@ -473,7 +481,7 @@ if "diagnostics" in st.session_state:
             st.info("无银行流水数据")
 
     # 显示核对过程详情
-    with st.expander("📋 核对过程详情（按科目/月份/Block）"):
+    with st.expander("📋 核对过程详情（按科目/月份）"):
         for proc in diag["matching_process"]:
             acc = proc["account"]
             st.markdown(f"**{acc}**")
@@ -481,43 +489,14 @@ if "diagnostics" in st.session_state:
                 df_months = pd.DataFrame(proc["months"])
                 df_months["年月"] = df_months.apply(lambda r: f"{r['year']}-{r['month']:02d}", axis=1)
                 df_months["收支"] = df_months["direction"].map({"income": "收入", "expense": "支出"})
-                df_months = df_months[["年月", "收支", "gl_count", "bank_count", "gl_sum", "bank_sum", "blocks", "matches"]]
+                df_months = df_months[["年月", "收支", "gl_count", "bank_count", "gl_sum", "bank_sum", "matches"]]
                 df_months = df_months.rename(columns={
                     "gl_count": "GL笔数", "bank_count": "Bank笔数",
                     "gl_sum": "GL金额", "bank_sum": "Bank金额",
-                    "blocks": "Block数", "matches": "匹配数",
+                    "matches": "匹配数",
                 })
                 st.dataframe(df_months, use_container_width=True)
 
-                # 展开每个 block 的详情
-                for m in proc["months"]:
-                    if m.get("block_log"):
-                        st.markdown(f"*_{m['year']}-{m['month']:02d} {'收入' if m['direction']=='income' else '支出'} — Block 详情_*")
-                        df_blocks = pd.DataFrame(m["block_log"])
-                        df_blocks = df_blocks.rename(columns={
-                            "gl_start": "GL起始", "gl_end": "GL结束", "gl_count": "GL笔数",
-                            "bank_start": "Bank起始", "bank_end": "Bank结束", "bank_count": "Bank笔数",
-                            "gl_sum": "GL金额", "bank_sum": "Bank金额", "diff": "差异",
-                        })
-                        st.dataframe(df_blocks, use_container_width=True)
-
-                        # 显示每个 block 内 GL/Bank 的原始顺序（诊断抢占问题）
-                        for blk in m["block_log"]:
-                            if blk.get("gl_details") or blk.get("bank_details"):
-                                with st.expander(f"🔍 Block {blk.get('gl_start',0)}-{blk.get('gl_end',0)} 内部明细"):
-                                    c1, c2 = st.columns(2)
-                                    with c1:
-                                        st.markdown("**GL 原始顺序（Excel行序）**")
-                                        if blk.get("gl_details"):
-                                            st.dataframe(pd.DataFrame(blk["gl_details"]), use_container_width=True)
-                                        else:
-                                            st.info("无 GL")
-                                    with c2:
-                                        st.markdown("**Bank 原始顺序（Excel行序）**")
-                                        if blk.get("bank_details"):
-                                            st.dataframe(pd.DataFrame(blk["bank_details"]), use_container_width=True)
-                                        else:
-                                            st.info("无 Bank")
             else:
                 st.info("无数据")
 
@@ -595,6 +574,9 @@ if "results" in st.session_state:
                 bid = id(b)
                 show_bank_amount = bid not in shown_bank_ids
                 shown_bank_ids.add(bid)
+                # GL客商格式化
+                gl_parties = getattr(gl, 'counterparties', None)
+                gl_parties_str = "，".join(gl_parties) if gl_parties else getattr(gl, 'customer_name', '')
                 all_matches.append({
                     "明细科目": acc,
                     "匹配方式": mtype_cn,
@@ -602,6 +584,7 @@ if "results" in st.session_state:
                     "GL凭证号": getattr(gl, 'voucher_no', ''),
                     "GL摘要": getattr(gl, 'abstract', ''),
                     "GL金额": gl.amount,
+                    "GL客商": gl_parties_str,
                     "Bank日期": getattr(b, 'tx_date', ''),
                     "Bank交易方": getattr(b, 'counter_party', ''),
                     "Bank金额": b.amount if show_bank_amount else None,
@@ -611,6 +594,8 @@ if "results" in st.session_state:
                     bid = id(b)
                     show_bank_amount = bid not in shown_bank_ids
                     shown_bank_ids.add(bid)
+                    gl_parties = getattr(gl, 'counterparties', None)
+                    gl_parties_str = "，".join(gl_parties) if gl_parties else getattr(gl, 'customer_name', '')
                     all_matches.append({
                         "明细科目": acc,
                         "匹配方式": mtype_cn,
@@ -618,18 +603,22 @@ if "results" in st.session_state:
                         "GL凭证号": getattr(gl, 'voucher_no', ''),
                         "GL摘要": getattr(gl, 'abstract', ''),
                         "GL金额": gl.amount if i == 0 else None,
+                        "GL客商": gl_parties_str if i == 0 else "",
                         "Bank日期": getattr(b, 'tx_date', ''),
                         "Bank交易方": getattr(b, 'counter_party', ''),
                         "Bank金额": b.amount if show_bank_amount else None,
                     })
 
         for gl in res.unmatched_gl:
+            gl_parties = getattr(gl, 'counterparties', None)
+            gl_parties_str = "，".join(gl_parties) if gl_parties else getattr(gl, 'customer_name', '')
             all_unmatched_gl.append({
                 "明细科目": acc,
                 "GL日期": getattr(gl, 'entry_date', None),
                 "GL凭证号": getattr(gl, 'voucher_no', ''),
                 "GL摘要": getattr(gl, 'abstract', ''),
                 "GL金额": gl.amount,
+                "GL客商": gl_parties_str,
             })
 
         for b in res.unmatched_bank:

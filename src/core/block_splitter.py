@@ -84,6 +84,24 @@ def split_into_blocks(
     if cut_points[-1] != (final_gl, final_bank):
         cut_points.append((final_gl, final_bank))
 
+    # 合并会拆散同客商 GL 的相邻 block
+    _merge_split_groups(gl_entries, cut_points)
+
+    # 处理总额不平导致的末尾空 block：将空 GL / 空 Bank 的剩余项合并到最后一个有效 block
+    while len(cut_points) >= 2:
+        last_gl, last_bank = cut_points[-2]
+        end_gl, end_bank = cut_points[-1]
+        if end_gl == last_gl and end_bank > last_bank:
+            # GL 已用完，Bank 有剩余 → 合并 Bank 到前一个 block
+            cut_points[-2] = (last_gl, end_bank)
+            cut_points.pop()
+        elif end_gl > last_gl and end_bank == last_bank:
+            # Bank 已用完，GL 有剩余 → 合并 GL 到前一个 block
+            cut_points[-2] = (end_gl, last_bank)
+            cut_points.pop()
+        else:
+            break
+
     log_info["cut_points"] = cut_points
 
     # 按切分点生成 blocks
@@ -114,6 +132,47 @@ def split_into_blocks(
         blocks.append((gl_block, bank_block))
 
     return blocks, log_info
+
+
+def _get_gl_party(gl_entry) -> str:
+    """从 GL 条目提取客商名称（用于判断是否同客商多笔）"""
+    parties = getattr(gl_entry, 'counterparties', None)
+    if parties:
+        return parties[0] if parties else ''
+    return getattr(gl_entry, 'customer_name', '') or ''
+
+
+def _merge_split_groups(gl_entries: List, cut_points: List[Tuple[int, int]]) -> None:
+    """
+    合并那些会拆散同客商 GL 的切分点。
+    如果相邻两个 block 的 GL 中有相同客商，删除中间的切分点将它们合并。
+    """
+    if len(cut_points) <= 2:
+        return  # 只有起点和终点，无需合并
+
+    # 先计算每个 block 区间的 GL 客商集合
+    block_parties = []
+    for k in range(1, len(cut_points)):
+        gl_start = cut_points[k - 1][0]
+        gl_end = cut_points[k][0]
+        parties = set()
+        for i in range(gl_start, gl_end):
+            p = _get_gl_party(gl_entries[i])
+            if p:
+                parties.add(p)
+        block_parties.append(parties)
+
+    # 从后往前合并，避免索引偏移
+    i = len(block_parties) - 1
+    while i > 0:
+        if block_parties[i] & block_parties[i - 1]:
+            # 有交集 → 合并：删除 cut_points[i]
+            del cut_points[i]
+            # 更新 block_parties：合并两个集合
+            merged = block_parties[i] | block_parties[i - 1]
+            block_parties[i - 1] = merged
+            del block_parties[i]
+        i -= 1
 
 
 def _cumsum(entries: List) -> List[float]:

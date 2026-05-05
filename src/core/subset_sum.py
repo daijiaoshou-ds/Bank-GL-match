@@ -1,5 +1,6 @@
 """子集和求解器：DP 优化版（替代暴力枚举）"""
 from typing import List, Optional, Tuple
+from src.utils.performance_logger import perf_logger
 
 
 def subset_sum_dp(
@@ -89,15 +90,23 @@ def subset_sum_dp_with_fallback(
     """
     带 fallback 的子集和求解
     先尝试 DP，如果失败且有少量元素，用回溯枚举兜底
-    
+
     返回: (indices_list, method)
     """
+    n = len(amounts)
+    if n > 30:
+        perf_logger.info(f"      DP子集和: {n}个元素, 目标={target:.2f}, max_size={max_size} [大数据集!]")
+
     result = subset_sum_dp(amounts, target, tol, max_size)
     if result is not None:
+        if n > 30:
+            perf_logger.info(f"      DP命中: {len(result)}个元素")
         return result, "dp_subset"
 
     # Fallback: 回溯枚举（元素少的时候才用）
     if len(amounts) <= 15:
+        if n > 8:
+            perf_logger.info(f"      DP未命中, 回溯枚举 {n}个元素...")
         result = _backtrack_subset(amounts, target, tol, max_size)
         if result is not None:
             return result, "backtrack_subset"

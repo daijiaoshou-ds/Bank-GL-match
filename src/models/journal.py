@@ -1,7 +1,7 @@
 """序时账数据模型"""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -16,6 +16,7 @@ class JournalEntry:
     debit: float                      # 借方金额
     credit: float                     # 贷方金额
     customer_name: Optional[str] = None  # 客商名称（可选）
+    counterparties: List[str] = field(default_factory=list)  # 对方科目分析后的客商列表（变形后填充）
 
     @property
     def amount(self) -> float:
